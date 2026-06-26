@@ -1,0 +1,19 @@
+torch
+torchvision
+accelerate
+wandb
+ml-collections
+timm
+einops
+numpy
+pillow
+pandas
+tqdm
+scipy
+matplotlib
+opencv-python
+scikit-image
+pytorch-fid
+bitsandbytes
+# xformers is optional but recommended (faster, lower-memory attention) - see improvement.md §3.2
+# xformers
