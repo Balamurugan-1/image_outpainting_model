@@ -53,6 +53,10 @@ def unpatchify(x, channels=3):
     return x
 
 
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -61,6 +65,11 @@ class Attention(nn.Module):
         self.scale = qk_scale or head_dim ** -0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # QK-norm: normalizing q/k before the dot product keeps attention logits from growing
+        # unboundedly with training progress, the same activation-magnitude failure mode that
+        # caused this project's fp16 overflow incidents (see details.md SS8b/8c).
+        self.q_norm = nn.LayerNorm(head_dim)
+        self.k_norm = nn.LayerNorm(head_dim)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -71,11 +80,13 @@ class Attention(nn.Module):
         if XFORMERS_IS_AVAILBLE:  # the xformers lib allows less memory, faster training and inference
             qkv = einops.rearrange(qkv, 'B L (K H D) -> K B L H D', K=3, H=self.num_heads)
             q, k, v = qkv[0], qkv[1], qkv[2]  # B L H D
+            q, k = self.q_norm(q), self.k_norm(k)
             x = xformers.ops.memory_efficient_attention(q, k, v)
             x = einops.rearrange(x, 'B L H D -> B L (H D)', H=self.num_heads)
         else:
             qkv = einops.rearrange(qkv, 'B L (K H D) -> K B H L D', K=3, H=self.num_heads)
             q, k, v = qkv[0], qkv[1], qkv[2]  # B H L D
+            q, k = self.q_norm(q), self.k_norm(k)
             attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
@@ -95,6 +106,8 @@ class CrossAttention(nn.Module):
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
         self.k = nn.Linear(dim, dim, bias=qkv_bias)
         self.v = nn.Linear(dim, dim, bias=qkv_bias)
+        self.q_norm = nn.LayerNorm(head_dim)
+        self.k_norm = nn.LayerNorm(head_dim)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -107,6 +120,7 @@ class CrossAttention(nn.Module):
         q = einops.rearrange(q, 'B L (H D) -> B H L D', H=self.num_heads)
         k = einops.rearrange(k, 'B L (H D) -> B H L D', H=self.num_heads)
         v = einops.rearrange(v, 'B L (H D) -> B H L D', H=self.num_heads)
+        q, k = self.q_norm(q), self.k_norm(k)
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
@@ -122,26 +136,39 @@ class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm, skip=False, use_checkpoint=False):
         super().__init__()
-        self.norm1 = norm_layer(dim)
+        # elementwise_affine=False: the scale/shift role of LayerNorm's own weight/bias is taken
+        # over by the AdaLN modulation below, following DiT (Peebles & Xie, 2022).
+        self.norm1 = norm_layer(dim, elementwise_affine=False)
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale)
-        self.norm2 = norm_layer(dim)
+        self.norm2 = norm_layer(dim, elementwise_affine=False)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer)
         self.skip_linear = nn.Linear(2 * dim, dim) if skip else None
         self.use_checkpoint = use_checkpoint
 
-    def forward(self, x, skip=None):
-        if self.use_checkpoint:
-            return torch.utils.checkpoint.checkpoint(self._forward, x, skip)
-        else:
-            return self._forward(x, skip)
+        # AdaLN-Zero timestep conditioning (DiT-style), replacing the original time-token
+        # concatenation. The final Linear is zero-initialized (done in UViT.__init__, after
+        # the generic trunc_normal_ init pass) so every block starts as an identity pass-through
+        # (gate=0) and only gradually learns to use the timestep — improves early-training
+        # stability and convergence speed versus making every token attend to a single time token.
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 6 * dim, bias=True),
+        )
 
-    def _forward(self, x, skip=None):
+    def forward(self, x, c, skip=None):
+        if self.use_checkpoint:
+            return torch.utils.checkpoint.checkpoint(self._forward, x, c, skip)
+        else:
+            return self._forward(x, c, skip)
+
+    def _forward(self, x, c, skip=None):
         if self.skip_linear is not None:
             x = self.skip_linear(torch.cat([x, skip], dim=-1))
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        shift1, scale1, gate1, shift2, scale2, gate2 = self.adaLN_modulation(c).chunk(6, dim=-1)
+        x = x + gate1.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift1, scale1))
+        x = x + gate2.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift2, scale2))
         return x
 
 
@@ -191,20 +218,46 @@ class UViT(nn.Module):
                 norm_layer=norm_layer, skip=skip, use_checkpoint=use_checkpoint)
             for _ in range(depth // 2)])
 
-        self.norm = norm_layer(embed_dim)
+        # Multi-point cross-attention injection: the original design only lets the decoder see the
+        # positional query once, at the encoder/decoder bottleneck (self.cross_attn below). Re-injecting
+        # it partway through the decoder arm (every other out_block) gives the model more chances to use
+        # positional information, which should matter most at extreme outpainting ratios. Applied
+        # residually (added, not replacing x) so it strictly augments — never overrides — the decoder's
+        # own features.
+        self.out_cross_attns = nn.ModuleList([
+            CrossAttention(embed_dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale)
+            for _ in range(len(self.out_blocks) // 2)])
+
+        self.norm = norm_layer(embed_dim, elementwise_affine=False)
         self.patch_dim = patch_size ** 2 * in_chans
         self.decoder_pred = nn.Linear(embed_dim, self.patch_dim, bias=True)
         self.final_layer = nn.Conv2d(self.in_chans, self.in_chans, 3, padding=1) if conv else nn.Identity()
+        # Final AdaLN modulation (shift/scale only, no gate — there's no residual branch here),
+        # same DiT-style mechanism as in Block.
+        self.final_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(embed_dim, 2 * embed_dim, bias=True),
+        )
 
         trunc_normal_(self.pos_embed, std=.02)
         self.apply(self._init_weights)
+
+        # Zero-init every AdaLN modulation's final Linear *after* the generic trunc_normal_ pass above
+        # (self.apply would otherwise immediately overwrite this zero-init for any nn.Linear it finds).
+        for blk in list(self.in_blocks) + [self.mid_block] + list(self.out_blocks):
+            nn.init.zeros_(blk.adaLN_modulation[-1].weight)
+            nn.init.zeros_(blk.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.final_modulation[-1].weight)
+        nn.init.zeros_(self.final_modulation[-1].bias)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
+        elif isinstance(m, nn.LayerNorm) and m.weight is not None:
+            # elementwise_affine=False LayerNorms (used wherever AdaLN modulation takes over the
+            # scale/shift role) have no weight/bias to initialize here.
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
         pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(math.sqrt(self.pos_embed.shape[1])), cls_token=False)
@@ -224,30 +277,28 @@ class UViT(nn.Module):
         x = torch.cat([anchor_view, x], dim=1)   # batch, 6, H, W
         x = self.patch_embed(x)
         target_pos = target_pos + self.masked_embed
-        
-        # add time embeddings
-        time_token = self.time_embed(timestep_embedding(timesteps, self.embed_dim))
-        time_token = time_token.unsqueeze(dim=1)
+
+        # AdaLN-Zero conditioning vector — replaces the old time-token-concatenation scheme, so x
+        # and target_pos stay at their natural num_patches length throughout (no extra token).
+        c = self.time_embed(timestep_embedding(timesteps, self.embed_dim))
         x = x + self.pos_embed
-        B, L, D = x.shape
-        # add conditions
-        x = torch.cat((time_token, x), dim=1)
-        target_pos = torch.cat((time_token, target_pos), dim=1)
 
         skips = []
         for blk in self.in_blocks:
-            x = blk(x)
+            x = blk(x, c)
             skips.append(x)
         x = self.cross_attn(x, target_pos)
 
-        x = self.mid_block(x)
+        x = self.mid_block(x, c)
 
-        for blk in self.out_blocks:
-            x = blk(x, skips.pop())
+        for i, blk in enumerate(self.out_blocks):
+            x = blk(x, c, skips.pop())
+            if i % 2 == 1:
+                x = x + self.out_cross_attns[i // 2](x, target_pos)
 
-        x = self.norm(x)
+        shift, scale = self.final_modulation(c).chunk(2, dim=-1)
+        x = modulate(self.norm(x), shift, scale)
         x = self.decoder_pred(x)
-        x = x[:, -L:, :]
         x = unpatchify(x, self.in_chans)
         x = self.final_layer(x)
         return x
